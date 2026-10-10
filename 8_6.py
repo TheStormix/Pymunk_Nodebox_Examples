@@ -4,7 +4,7 @@ from nodebox.graphics import *
 import pymunk
 import pymunk.pyglet_util
 import random, math
-import numpy as np
+from rl_agent import QLearningAgent
 
 space = pymunk.Space()
 
@@ -22,10 +22,13 @@ s0.score=0
 s3=createBody(200, 300, pymunk.Poly, ((-20,-5),(-20,5),(20,15),(20,-15)))
 s3.color = (0, 255, 0, 255)
 s3.score=0
-s3.body.Q=[[0, 0], [0, 0], [0, 0]]
-#s3.body.Q=[[0, 0], [1, -1], [-1, 1]]
-#Q=[нічого[залишати, змінювати], об'єкт[залишати, змінювати], антиоб'єкт[залишати, змінювати]]
-s3.body.action=0 # 0 - залишати, 1 - змінювати (випадковий кут)
+# Tabular Q-learning policy for the green robot.
+s3.body.action = 0
+s3.body.previous_score = 0
+agent = QLearningAgent(states=4, actions=2, alpha=0.30, gamma=0.90,
+                       epsilon=0.60, epsilon_min=0.05, epsilon_decay=0.999,
+                       seed=9)
+
 s1=createBody(300, 200, pymunk.Circle, 10, (0,0))
 S2=[]
 for i in range(1):
@@ -45,13 +48,13 @@ def inCircle(x,y,cx,cy,R):
         return True
     return False
 
-def inSector(x,y,cx,cy,R,a):
-    angle=getAngle(cx,cy,x,y)
-    a=a%(2*math.pi)
-    angle=angle%(2*math.pi)
-    if inCircle(x,y,cx,cy,R) and a-0.5<angle<a+0.5:
-        return True
-    return False
+def inSector(x, y, cx, cy, R, a):
+    # Angular distance must wrap correctly at -pi/pi and 0/2pi.
+    if not inCircle(x, y, cx, cy, R):
+        return False
+    angle = getAngle(cx, cy, x, y)
+    angular_difference = (angle-a+math.pi) % (2*math.pi) - math.pi
+    return abs(angular_difference) < 0.5
 
 def strategy(b=s3.body):
     v=100
@@ -68,47 +71,66 @@ def strategy(b=s3.body):
             b.angle=getAngle(x,y,*s1.body.position) #2*math.pi*random.random()
 
 def strategy2(b=s3.body):
-    u"""Стратегія робота, який сканує сектор ультразвуковим сенсором, з реалізацією найпростішого машинного навчаннм з підкріпленням (Q-learning). Кожні 10 кадрів визначається чи обєкти s1 або s2 знаходяться в межах сектора. Якщо це s1 то стан=об'єкт. Якщо це s2 то стан= антиоб'єкт. Якщо нічого, то стан=нічого.  Установлюється стан і винагорода. В Q-таблиці (див.) оновлюється сума винагород, яка відповдає стану і дії. Дія 0 - залишати напрямок, 1 - змінювати (випадковий кут). Далі алгоритм вибирає дію. З заданими імовірностями дія може бути випадковою або відповідати дії з максимальною сумою винагород для цього стану (оптимальною). Далі дія виконується. Вкінці алгоритм запобігає виїзду робота за межі кола."""
-    v=100
-    a=b.angle
-    b.velocity=v*cos(a), v*sin(a)
-    x,y=b.position
-    R=getDist(x,y,350,250)
+    u"""Green robot policy with epsilon-greedy tabular Q-learning.
+
+    Observe every 10 frames. Previous (state, action) is updated with
+    reward and the next state's best value (Bellman TD target).
+    """
+    speed = 100
+    heading = b.angle
+    b.velocity = speed * math.cos(heading), speed * math.sin(heading)
+    x, y = b.position
+    radius = getDist(x, y, 350, 250)
+
+    # Visualize the 100-pixel, +/-0.5 rad ultrasonic sensor sector.
     ellipse(x, y, 200, 200, stroke=Color(0.5))
-    #line(x,y,x+100*cos(a),y+100*sin(a),stroke=Color(0.5))
-    line(x,y,x+100*cos(a+0.5),y+100*sin(a+0.5),stroke=Color(0.5))
-    line(x,y,x+100*cos(a-0.5),y+100*sin(a-0.5),stroke=Color(0.5))
+    line(x, y, x+100*math.cos(heading+0.5),
+         y+100*math.sin(heading+0.5), stroke=Color(0.5))
+    line(x, y, x+100*math.cos(heading-0.5),
+         y+100*math.sin(heading-0.5), stroke=Color(0.5))
 
-    if canvas.frame%10==0: # кожні n кадірів
-        inS=inSector(s1.body.position[0], s1.body.position[1], x, y, 100, a)
-        inS2=inSector(S2[0].body.position[0], S2[0].body.position[1], x, y, 100, a)
-
-        # установлюємо стан і винагороду
-        if inS:
-            state=1
-            reward=1 if b.action==0 else -1
-        elif inS2:
-            state=2
-            reward=-1 if b.action==0 else 1
+    if canvas.frame % 10 == 0:
+        sees_target = inSector(s1.body.position[0], s1.body.position[1],
+                               x, y, 100, heading)
+        sees_anti = any(inSector(item.body.position[0], item.body.position[1],
+                                 x, y, 100, heading) for item in S2)
+        # Distance to arena centre has priority: safe boundary override.
+        if radius > 160:
+            state = 3
+        elif sees_anti:
+            state = 2
+        elif sees_target:
+            state = 1
         else:
-            state=0; reward=0
-        b.Q[state][b.action] +=reward # оновлюємо Q таблицю
-        print state, b.action, b.Q
+            state = 0
 
-        # вибираємо дію
-        #if random.choice([1, 0, 0]): # деколи випадково
-        #if random.random()<0.1:
-        act=b.Q[state][b.action]
-        if random.random()<abs(1.0/(act+0.1)): # 0.1 запобігає /0
-            b.action=random.choice([0, 1]) # випадково 50/50
-        else:
-            b.action=np.argmax(b.Q[state]) # залишати чи змінювати?
+        # Reward is observed after the previous decision.
+        score_change = s3.score - b.previous_score
+        reward = 4.0 * score_change
+        b.previous_score = s3.score
+        if agent.previous_action is not None:
+            if state == 1:
+                reward += 0.4 if agent.previous_action == 0 else -0.2
+            elif state == 2:
+                reward += -0.4 if agent.previous_action == 0 else 0.4
+            elif state == 3:
+                reward -= 0.6
 
-        if b.action: # якщо змінювати
-            b.angle=2*math.pi*random.random()
+        b.action = agent.step(state, reward)
+        if b.action == 1:
+            if state == 2:
+                # Turn away when an anti-target is seen.
+                b.angle = (heading + math.pi) % (2*math.pi)
+            else:
+                b.angle = 2*math.pi*random.random()
 
-        if R>180: # запобігти виїзду за межі
-            b.angle=getAngle(x,y,350,250)
+        if agent.steps % 100 == 0:
+            print('RL decisions=%d epsilon=%.3f Q=%s' %
+                  (agent.steps, agent.epsilon, agent.q))
+
+    # Physics boundary override (original simulation uses radius 180).
+    if radius > 165:
+        b.angle = getAngle(x, y, 350, 250)
 
 def scr(s,s0,s3,p=1):
     bx,by=s.body.position
@@ -157,6 +179,7 @@ def draw(canvas):
     canvas.clear()
     fill(0,0,0,1)
     text("%i %i"%(s0.score,s3.score),20,20)
+    text("RL: decisions=%d epsilon=%.2f" % (agent.steps, agent.epsilon), 20, 42)
     nofill()
     ellipse(350, 250, 350, 350, stroke=Color(0))
     manualControl()
